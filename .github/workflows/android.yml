@@ -1,1 +1,116 @@
+name: Android CI
 
+# Berjalan saat push ke main/master. Mendukung dua susunan repo:
+#  1) File proyek langsung di root repo (ada settings.gradle.kts), atau
+#  2) Hanya berisi file ZIP proyek (mis. RepoDeck.zip yang diunggah dari aplikasi): ZIP diekstrak otomatis.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build RepoDeck APK
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cari proyek (ekstrak ZIP bila perlu)
+        run: |
+          DIR="$GITHUB_WORKSPACE"
+          if [ ! -f "$DIR/settings.gradle.kts" ] && [ ! -f "$DIR/settings.gradle" ]; then
+            ZIP="$(ls -t "$GITHUB_WORKSPACE"/*.zip 2>/dev/null | head -n 1 || true)"
+            if [ -z "$ZIP" ]; then
+              echo "::error::Tidak ada proyek Gradle maupun file ZIP di root repo."
+              exit 1
+            fi
+            echo "Mengekstrak $ZIP"
+            mkdir -p "$RUNNER_TEMP/src"
+            unzip -q -o "$ZIP" -d "$RUNNER_TEMP/src"
+            FOUND="$(find "$RUNNER_TEMP/src" -maxdepth 3 -name 'settings.gradle*' | head -n 1)"
+            if [ -z "$FOUND" ]; then
+              echo "::error::settings.gradle tidak ditemukan di dalam ZIP."
+              exit 1
+            fi
+            DIR="$(dirname "$FOUND")"
+          fi
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Proyek: $DIR"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-34
+            build-tools;34.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Siapkan keystore
+        id: keystore
+        run: |
+          KS="$RUNNER_TEMP/release.keystore"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          elif [ -f "$PROJECT_DIR/keystore.jks" ]; then
+            cp "$PROJECT_DIR/keystore.jks" "$KS"
+          fi
+          if [ -s "$KS" ]; then
+            if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+              echo "::error::Keystore ditemukan tetapi KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD belum diisi."
+              exit 1
+            fi
+            echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Keystore belum diatur. Build debug dibuat tanpa keystore lama."
+          fi
+
+      - name: Build release APK (bertanda tangan keystore)
+        if: steps.keystore.outputs.signed == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon --stacktrace assembleRelease
+
+      - name: Build debug APK (tanpa keystore)
+        if: steps.keystore.outputs.signed != 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Cek tanda tangan APK
+        if: steps.keystore.outputs.signed == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          for apk in app/build/outputs/apk/release/*.apk; do
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$apk" | grep -i "SHA-256" || true
+          done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RepoDeck-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/*/*.apk
+          if-no-files-found: error
+          retention-days: 14
